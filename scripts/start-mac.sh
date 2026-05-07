@@ -7,6 +7,8 @@ PORT="${PORT:-8000}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+DATA_DIR="${ROOT_DIR}/backend/data"
+mkdir -p "$DATA_DIR"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker is required but not installed."
@@ -21,12 +23,14 @@ if [[ -f ".env" ]]; then
   CONTAINER_ID="$(docker run -d \
     --name "$CONTAINER_NAME" \
     -p "${PORT}:8000" \
+    -v "${DATA_DIR}:/app/backend/data" \
     --env-file ".env" \
     "$IMAGE_NAME")"
 else
   CONTAINER_ID="$(docker run -d \
     --name "$CONTAINER_NAME" \
     -p "${PORT}:8000" \
+    -v "${DATA_DIR}:/app/backend/data" \
     "$IMAGE_NAME")"
 fi
 

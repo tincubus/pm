@@ -1,15 +1,21 @@
 from pathlib import Path
+from secrets import token_urlsafe
 
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
+
+from app import ai, ai_chat, db
 
 app = FastAPI(title="PM MVP Backend")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "pm.db"
 SESSION_COOKIE_NAME = "pm_session"
-SESSION_COOKIE_VALUE = "authenticated"
 MVP_USERNAME = "user"
 MVP_PASSWORD = "password"
+ACTIVE_SESSIONS: dict[str, str] = {}
+CONVERSATION_HISTORY: dict[int, list[dict[str, str]]] = {}
 
 LOGIN_PAGE_HTML = """<!doctype html>
 <html lang="en">
@@ -130,8 +136,59 @@ LOGIN_PAGE_HTML = """<!doctype html>
 """
 
 
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class RenameColumnPayload(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
+class CreateCardPayload(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    details: str = Field(default="", max_length=5000)
+
+
+class UpdateCardPayload(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    details: str = Field(default="", max_length=5000)
+
+
+class MoveCardPayload(BaseModel):
+    target_column_id: int
+    target_position: int | None = Field(default=None, ge=0)
+
+
+class AIChatPayload(BaseModel):
+    message: str = Field(min_length=1, max_length=6000)
+
+
 def is_authenticated(request: Request) -> bool:
-    return request.cookies.get(SESSION_COOKIE_NAME) == SESSION_COOKIE_VALUE
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    return bool(session_token and session_token in ACTIVE_SESSIONS)
+
+
+def get_authenticated_user_id(request: Request) -> int:
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    username = ACTIVE_SESSIONS.get(session_token or "")
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+    user = db.get_user_by_username(DB_PATH, username)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+    return int(user["id"])
+
+
+def clear_session(request: Request, response: Response) -> None:
+    ACTIVE_SESSIONS.pop(request.cookies.get(SESSION_COOKIE_NAME, ""), None)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
 
 
 def static_path_for(full_path: str) -> Path:
@@ -157,18 +214,29 @@ def hello() -> dict[str, str]:
     return {"message": "hello world"}
 
 
+@app.on_event("startup")
+def startup() -> None:
+    ACTIVE_SESSIONS.clear()
+    CONVERSATION_HISTORY.clear()
+    db.init_database(DB_PATH, MVP_USERNAME, MVP_PASSWORD)
+
+
 @app.post("/api/auth/login")
-async def login(payload: dict[str, str]) -> Response:
-    username = payload.get("username", "")
-    password = payload.get("password", "")
-    if username != MVP_USERNAME or password != MVP_PASSWORD:
+async def login(payload: LoginPayload) -> Response:
+    user = db.get_user_by_username(DB_PATH, payload.username)
+    is_valid = user is not None and (
+        user["password_hash"] == db.hash_password(payload.password)
+    )
+    if not is_valid:
         return JSONResponse(
             {"ok": False, "error": "Invalid credentials"}, status_code=401
         )
+    session_token = token_urlsafe(32)
+    ACTIVE_SESSIONS[session_token] = payload.username
     response = JSONResponse({"ok": True})
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
-        value=SESSION_COOKIE_VALUE,
+        value=session_token,
         httponly=True,
         samesite="lax",
         secure=False,
@@ -178,15 +246,191 @@ async def login(payload: dict[str, str]) -> Response:
 
 
 @app.post("/api/auth/logout")
-def logout() -> Response:
+def logout(request: Request) -> Response:
     response = JSONResponse({"ok": True})
-    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    clear_session(request, response)
+    return response
+
+
+@app.get("/logout")
+def logout_and_redirect(request: Request) -> Response:
+    response = RedirectResponse("/", status_code=303)
+    clear_session(request, response)
     return response
 
 
 @app.get("/api/auth/session")
 def session(request: Request) -> dict[str, bool]:
     return {"authenticated": is_authenticated(request)}
+
+
+@app.get("/api/board")
+def get_board(request: Request) -> dict:
+    user_id = get_authenticated_user_id(request)
+    return db.get_board_payload(DB_PATH, user_id)
+
+
+@app.patch("/api/columns/{column_id}")
+def rename_column(column_id: int, payload: RenameColumnPayload, request: Request) -> dict:
+    user_id = get_authenticated_user_id(request)
+    ok = db.rename_column(DB_PATH, user_id, column_id, payload.title.strip())
+    if not ok:
+        raise HTTPException(status_code=404, detail="Column not found")
+    return {"ok": True}
+
+
+@app.post("/api/columns/{column_id}/cards")
+def add_card(column_id: int, payload: CreateCardPayload, request: Request) -> dict:
+    user_id = get_authenticated_user_id(request)
+    card = db.create_card(
+        DB_PATH,
+        user_id,
+        column_id,
+        payload.title.strip(),
+        payload.details.strip(),
+    )
+    if card is None:
+        raise HTTPException(status_code=404, detail="Column not found")
+    return {"ok": True, "card": card}
+
+
+@app.patch("/api/cards/{card_id}")
+def edit_card(card_id: int, payload: UpdateCardPayload, request: Request) -> dict:
+    user_id = get_authenticated_user_id(request)
+    card = db.update_card(
+        DB_PATH,
+        user_id,
+        card_id,
+        payload.title.strip(),
+        payload.details.strip(),
+    )
+    if card is None:
+        raise HTTPException(status_code=404, detail="Card not found")
+    return {"ok": True, "card": card}
+
+
+@app.post("/api/cards/{card_id}/move")
+def move_card(card_id: int, payload: MoveCardPayload, request: Request) -> dict:
+    user_id = get_authenticated_user_id(request)
+    ok = db.move_card(
+        DB_PATH,
+        user_id,
+        card_id,
+        payload.target_column_id,
+        payload.target_position,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Card or column not found")
+    return {"ok": True}
+
+
+@app.delete("/api/cards/{card_id}")
+def remove_card(card_id: int, request: Request) -> dict:
+    user_id = get_authenticated_user_id(request)
+    ok = db.delete_card(DB_PATH, user_id, card_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Card not found")
+    return {"ok": True}
+
+
+@app.post("/api/ai/smoke")
+def ai_smoke_test(request: Request) -> dict:
+    _ = get_authenticated_user_id(request)
+    try:
+        answer = ai.run_smoke_test()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="OpenRouter request failed") from exc
+    return {"ok": True, "model": ai.OPENROUTER_MODEL, "response": answer}
+
+
+@app.post("/api/ai/chat")
+def ai_chat_route(payload: AIChatPayload, request: Request) -> dict:
+    user_id = get_authenticated_user_id(request)
+    board_payload = db.get_board_payload(DB_PATH, user_id)
+    history = CONVERSATION_HISTORY.get(user_id, [])
+    messages = ai_chat.build_ai_messages(board_payload, payload.message, history)
+
+    try:
+        raw_output = ai.send_chat_messages_with_env(messages)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="OpenRouter request failed") from exc
+
+    parse_error = False
+    applied_operations: list[str] = []
+    updated_board = board_payload
+
+    try:
+        structured = ai_chat.parse_structured_response(raw_output)
+        assistant_response = structured.assistant_response
+    except ValueError:
+        parse_error = True
+        assistant_response = (
+            "I could not format a valid structured response. "
+            "No board changes were applied."
+        )
+        structured = ai_chat.StructuredAssistantResponse(
+            assistant_response=assistant_response,
+            board_update=None,
+        )
+
+    board_update = structured.board_update
+    if not parse_error and board_update is not None:
+        for action in board_update.rename_columns:
+            if db.rename_column(DB_PATH, user_id, action.column_id, action.title.strip()):
+                applied_operations.append(f"renamed column {action.column_id}")
+        for action in board_update.create_cards:
+            created = db.create_card(
+                DB_PATH,
+                user_id,
+                action.column_id,
+                action.title.strip(),
+                action.details.strip(),
+            )
+            if created is not None:
+                applied_operations.append(f"created card {created['id']}")
+        for action in board_update.update_cards:
+            updated = db.update_card(
+                DB_PATH,
+                user_id,
+                action.card_id,
+                action.title.strip(),
+                action.details.strip(),
+            )
+            if updated is not None:
+                applied_operations.append(f"updated card {action.card_id}")
+        for action in board_update.move_cards:
+            moved = db.move_card(
+                DB_PATH,
+                user_id,
+                action.card_id,
+                action.target_column_id,
+                action.target_position,
+            )
+            if moved:
+                applied_operations.append(f"moved card {action.card_id}")
+        for card_id in board_update.delete_cards:
+            deleted = db.delete_card(DB_PATH, user_id, card_id)
+            if deleted:
+                applied_operations.append(f"deleted card {card_id}")
+
+        updated_board = db.get_board_payload(DB_PATH, user_id)
+
+    history.append({"role": "user", "content": payload.message})
+    history.append({"role": "assistant", "content": assistant_response})
+    CONVERSATION_HISTORY[user_id] = history[-20:]
+
+    return {
+        "ok": True,
+        "model": ai.OPENROUTER_MODEL,
+        "response": assistant_response,
+        "parse_error": parse_error,
+        "applied_operations": applied_operations,
+        "board": updated_board,
+    }
 
 
 @app.get("/{full_path:path}", response_class=HTMLResponse, response_model=None)

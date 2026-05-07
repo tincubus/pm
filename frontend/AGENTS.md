@@ -29,14 +29,14 @@ The `frontend/` directory contains a standalone Next.js Kanban demo that current
 - Cards can be dragged within a column and across columns.
 - New cards can be added to a column.
 - Cards can be removed from a column.
-- No authentication, no persistence, and no backend API usage yet.
+- Frontend now uses backend APIs for persistence when available.
+- Includes a sidebar AI assistant chat widget that calls backend AI endpoints.
 
 ## Important Limits of Current Frontend
 
-- Card content is not editable after creation.
-- State resets on page refresh (in-memory only).
-- No AI chat UI in current implementation.
-- No user session/login flow in current implementation.
+- Card content is not editable after creation from the standard card UI.
+- Chat history in sidebar is in-memory per page load.
+- Full auth + persistence + AI integration depends on backend availability.
 
 ## Visual System
 
