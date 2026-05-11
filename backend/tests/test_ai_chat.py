@@ -18,7 +18,7 @@ def setup_paths(tmp_path, monkeypatch):
 def login(client: TestClient) -> None:
     response = client.post(
         "/api/auth/login",
-        json={"username": "user", "password": "password"},
+        json={"email": "user@local.pm", "password": "password"},
     )
     assert response.status_code == 200
 

@@ -1,3 +1,5 @@
+import os
+import time
 from pathlib import Path
 from secrets import token_urlsafe
 
@@ -14,7 +16,9 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "pm.db"
 SESSION_COOKIE_NAME = "pm_session"
 MVP_USERNAME = "user"
 MVP_PASSWORD = "password"
-ACTIVE_SESSIONS: dict[str, str] = {}
+SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+MIN_PASSWORD_LENGTH = 8
+COOKIE_SECURE = os.getenv("PM_COOKIE_SECURE", "false").strip().lower() == "true"
 CONVERSATION_HISTORY: dict[int, list[dict[str, str]]] = {}
 
 LOGIN_PAGE_HTML = """<!doctype html>
@@ -95,39 +99,72 @@ LOGIN_PAGE_HTML = """<!doctype html>
   <body>
     <main class="card">
       <h1>Sign in</h1>
-      <p>Use the MVP credentials to access the Kanban board.</p>
+      <p>Create an account or sign in to access your Kanban board.</p>
       <form id="login-form">
-        <label for="username">Username</label>
-        <input id="username" name="username" type="text" autocomplete="username" required />
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" autocomplete="email" required />
         <label for="password">Password</label>
         <input id="password" name="password" type="password" autocomplete="current-password" required />
         <button type="submit">Sign in</button>
         <div class="error" id="error"></div>
       </form>
-      <div class="hint">MVP credentials: <strong>user</strong> / <strong>password</strong></div>
+      <form id="signup-form" style="margin-top: 14px;">
+        <label for="signup-email">New account email</label>
+        <input id="signup-email" name="email" type="email" autocomplete="email" required />
+        <label for="signup-password">New account password (min 8 chars)</label>
+        <input id="signup-password" name="password" type="password" autocomplete="new-password" minlength="8" required />
+        <button type="submit">Create account</button>
+        <div class="error" id="signup-error"></div>
+      </form>
+      <div class="hint">Seeded test account: <strong>user@local.pm</strong> / <strong>password</strong></div>
     </main>
     <script>
       const form = document.getElementById("login-form");
       const errorEl = document.getElementById("error");
+      const signupForm = document.getElementById("signup-form");
+      const signupErrorEl = document.getElementById("signup-error");
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
         errorEl.textContent = "";
         const formData = new FormData(form);
-        const username = String(formData.get("username") || "");
+        const email = String(formData.get("email") || "");
         const password = String(formData.get("password") || "");
         try {
           const response = await fetch("/api/auth/login", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username, password })
+            body: JSON.stringify({ email, password })
           });
           if (!response.ok) {
-            errorEl.textContent = "Invalid username or password.";
+            errorEl.textContent = "Invalid email or password.";
             return;
           }
           window.location.href = "/";
         } catch (error) {
           errorEl.textContent = "Unable to sign in. Try again.";
+        }
+      });
+
+      signupForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        signupErrorEl.textContent = "";
+        const formData = new FormData(signupForm);
+        const email = String(formData.get("email") || "");
+        const password = String(formData.get("password") || "");
+        try {
+          const response = await fetch("/api/auth/register", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email, password })
+          });
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            signupErrorEl.textContent = payload.detail || "Unable to create account.";
+            return;
+          }
+          window.location.href = "/";
+        } catch (error) {
+          signupErrorEl.textContent = "Unable to create account. Try again.";
         }
       });
     </script>
@@ -137,7 +174,12 @@ LOGIN_PAGE_HTML = """<!doctype html>
 
 
 class LoginPayload(BaseModel):
-    username: str
+    email: str
+    password: str
+
+
+class RegisterPayload(BaseModel):
+    email: str
     password: str
 
 
@@ -166,28 +208,59 @@ class AIChatPayload(BaseModel):
 
 def is_authenticated(request: Request) -> bool:
     session_token = request.cookies.get(SESSION_COOKIE_NAME)
-    return bool(session_token and session_token in ACTIVE_SESSIONS)
+    if not session_token:
+        return False
+    session = db.get_session_user_by_token(
+        DB_PATH,
+        db.hash_session_token(session_token),
+        int(time.time()),
+    )
+    return session is not None
 
 
 def get_authenticated_user_id(request: Request) -> int:
     session_token = request.cookies.get(SESSION_COOKIE_NAME)
-    username = ACTIVE_SESSIONS.get(session_token or "")
-    if not username:
+    if not session_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
         )
-    user = db.get_user_by_username(DB_PATH, username)
-    if user is None:
+    token_hash = db.hash_session_token(session_token)
+    session = db.get_session_user_by_token(DB_PATH, token_hash, int(time.time()))
+    if session is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
         )
-    return int(user["id"])
+    db.touch_session_expiry(DB_PATH, token_hash, int(time.time()) + SESSION_TTL_SECONDS)
+    return int(session["user_id"])
+
+
+def create_authenticated_response(user_id: int) -> Response:
+    db.delete_expired_sessions(DB_PATH, int(time.time()))
+    session_token = token_urlsafe(32)
+    db.create_session(
+        DB_PATH,
+        user_id=user_id,
+        token_hash=db.hash_session_token(session_token),
+        expires_at=int(time.time()) + SESSION_TTL_SECONDS,
+    )
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        samesite="lax",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
+    return response
 
 
 def clear_session(request: Request, response: Response) -> None:
-    ACTIVE_SESSIONS.pop(request.cookies.get(SESSION_COOKIE_NAME, ""), None)
+    session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if session_token:
+        db.delete_session_by_token(DB_PATH, db.hash_session_token(session_token))
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
 
 
@@ -216,33 +289,43 @@ def hello() -> dict[str, str]:
 
 @app.on_event("startup")
 def startup() -> None:
-    ACTIVE_SESSIONS.clear()
     CONVERSATION_HISTORY.clear()
     db.init_database(DB_PATH, MVP_USERNAME, MVP_PASSWORD)
 
 
+@app.post("/api/auth/register")
+async def register(payload: RegisterPayload) -> Response:
+    email = db.normalize_email(payload.email)
+    password = payload.password
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email address is required")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
+        )
+    user = db.create_user(DB_PATH, email, password)
+    if user is None:
+        raise HTTPException(status_code=409, detail="Email is already registered")
+    return create_authenticated_response(int(user["id"]))
+
+
 @app.post("/api/auth/login")
 async def login(payload: LoginPayload) -> Response:
-    user = db.get_user_by_username(DB_PATH, payload.username)
-    is_valid = user is not None and (
-        user["password_hash"] == db.hash_password(payload.password)
-    )
+    user = db.get_user_by_email(DB_PATH, payload.email)
+    if user is None:
+        return JSONResponse(
+            {"ok": False, "error": "Invalid credentials"}, status_code=401
+        )
+    is_valid, needs_rehash = db.verify_password(user["password_hash"], payload.password)
     if not is_valid:
         return JSONResponse(
             {"ok": False, "error": "Invalid credentials"}, status_code=401
         )
-    session_token = token_urlsafe(32)
-    ACTIVE_SESSIONS[session_token] = payload.username
-    response = JSONResponse({"ok": True})
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_token,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        path="/",
-    )
-    return response
+    user_id = int(user["id"])
+    if needs_rehash:
+        db.update_user_password(DB_PATH, user_id, payload.password)
+    return create_authenticated_response(user_id)
 
 
 @app.post("/api/auth/logout")
@@ -260,8 +343,23 @@ def logout_and_redirect(request: Request) -> Response:
 
 
 @app.get("/api/auth/session")
-def session(request: Request) -> dict[str, bool]:
-    return {"authenticated": is_authenticated(request)}
+def session(request: Request) -> dict:
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_token:
+        return {"authenticated": False, "user": None}
+    token_hash = db.hash_session_token(session_token)
+    row = db.get_session_user_by_token(DB_PATH, token_hash, int(time.time()))
+    if row is None:
+        return {"authenticated": False, "user": None}
+    db.touch_session_expiry(DB_PATH, token_hash, int(time.time()) + SESSION_TTL_SECONDS)
+    return {
+        "authenticated": True,
+        "user": {
+            "id": int(row["user_id"]),
+            "username": row["username"],
+            "email": row["email"],
+        },
+    }
 
 
 @app.get("/api/board")

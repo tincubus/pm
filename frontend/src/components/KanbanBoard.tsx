@@ -46,6 +46,11 @@ type AIChatResponse = {
   parse_error: boolean;
 };
 
+type SessionPayload = {
+  authenticated: boolean;
+  user: { id: number; username: string; email: string } | null;
+};
+
 const toUiCardId = (id: number) => `card-${id}`;
 
 const toUiBoard = (backendBoard: BackendBoard) => {
@@ -94,6 +99,7 @@ export const KanbanBoard = () => {
   const [chatInput, setChatInput] = useState("");
   const [isChatSending, setIsChatSending] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [boardLoadError, setBoardLoadError] = useState<string | null>(null);
 
   const applyBackendBoard = useCallback((backendBoard: BackendBoard) => {
     const { board: nextBoard, maps } = toUiBoard(backendBoard);
@@ -110,15 +116,35 @@ export const KanbanBoard = () => {
     const backendBoard = (await response.json()) as BackendBoard;
     applyBackendBoard(backendBoard);
     setUsesBackend(true);
+    setBoardLoadError(null);
   }, [applyBackendBoard]);
 
   useEffect(() => {
     let isMounted = true;
-    void loadBoardFromBackend().catch(() => {
-      if (isMounted) {
-        setUsesBackend(false);
+    void (async () => {
+      try {
+        const sessionResponse = await fetch("/api/auth/session");
+        if (!sessionResponse.ok) {
+          throw new Error("Unable to check session");
+        }
+        const session = (await sessionResponse.json()) as SessionPayload;
+        if (!session.authenticated) {
+          if (isMounted) {
+            setUsesBackend(false);
+            setBoardLoadError("Authentication required. Please sign in.");
+          }
+          return;
+        }
+        await loadBoardFromBackend();
+      } catch {
+        if (isMounted) {
+          setUsesBackend(false);
+          setBoardLoadError(
+            "Backend unavailable. Local fallback mode is active for UI-only work."
+          );
+        }
       }
-    });
+    })();
     return () => {
       isMounted = false;
     };
@@ -395,6 +421,11 @@ export const KanbanBoard = () => {
               </div>
             ))}
           </div>
+          {boardLoadError ? (
+            <p className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              {boardLoadError}
+            </p>
+          ) : null}
         </header>
 
         <section className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">

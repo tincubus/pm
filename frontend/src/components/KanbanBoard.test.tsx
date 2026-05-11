@@ -1,10 +1,15 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { vi } from "vitest";
 import { KanbanBoard } from "@/components/KanbanBoard";
 
 const getFirstColumn = () => screen.getAllByTestId(/column-/i)[0];
 
 describe("KanbanBoard", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("renders five columns", () => {
     render(<KanbanBoard />);
     expect(screen.getAllByTestId(/column-/i)).toHaveLength(5);
@@ -42,5 +47,23 @@ describe("KanbanBoard", () => {
     await userEvent.click(deleteButton);
 
     expect(within(column).queryByText("New card")).not.toBeInTheDocument();
+  });
+
+  it("shows auth warning when session is unauthenticated", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ authenticated: false, user: null }),
+      })
+    );
+
+    render(<KanbanBoard />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Authentication required. Please sign in.")
+      ).toBeInTheDocument();
+    });
   });
 });

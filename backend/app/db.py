@@ -1,4 +1,6 @@
 import hashlib
+import hmac
+import secrets
 import sqlite3
 from pathlib import Path
 
@@ -54,8 +56,68 @@ DEFAULT_CARDS: list[tuple[str, str, str]] = [
 ]
 
 
-def hash_password(password: str) -> str:
+PASSWORD_SCHEME_SCRYPT = "scrypt"
+SCRYPT_N = 2**14
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_KEY_LEN = 64
+LOCAL_EMAIL_DOMAIN = "local.pm"
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def hash_session_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _legacy_sha256_hash(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    key = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+        dklen=SCRYPT_KEY_LEN,
+    )
+    return (
+        f"{PASSWORD_SCHEME_SCRYPT}${SCRYPT_N}${SCRYPT_R}"
+        f"${SCRYPT_P}${salt.hex()}${key.hex()}"
+    )
+
+
+def verify_password(stored_hash: str, password: str) -> tuple[bool, bool]:
+    parts = stored_hash.split("$")
+    if len(parts) == 6 and parts[0] == PASSWORD_SCHEME_SCRYPT:
+        try:
+            n = int(parts[1])
+            r = int(parts[2])
+            p = int(parts[3])
+            salt = bytes.fromhex(parts[4])
+            expected = bytes.fromhex(parts[5])
+        except (ValueError, TypeError):
+            return False, False
+
+        candidate = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt,
+            n=n,
+            r=r,
+            p=p,
+            dklen=len(expected),
+        )
+        return hmac.compare_digest(candidate, expected), False
+
+    legacy = _legacy_sha256_hash(password)
+    if hmac.compare_digest(stored_hash, legacy):
+        return True, True
+    return False, False
 
 
 def get_connection(db_path: Path) -> sqlite3.Connection:
@@ -66,6 +128,65 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _default_email_for_username(username: str) -> str:
+    return f"{username}@{LOCAL_EMAIL_DOMAIN}"
+
+
+def _ensure_board_for_user_conn(conn: sqlite3.Connection, user_id: int) -> int:
+    board = conn.execute(
+        "SELECT id FROM boards WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if board is None:
+        conn.execute(
+            "INSERT INTO boards (user_id, name, settings_json) VALUES (?, ?, '{}')",
+            (user_id, "My Project Board"),
+        )
+        board = conn.execute(
+            "SELECT id FROM boards WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    board_id = int(board["id"])
+
+    existing_columns = conn.execute(
+        "SELECT COUNT(*) AS count FROM columns WHERE board_id = ?",
+        (board_id,),
+    ).fetchone()
+    if int(existing_columns["count"]) == 0:
+        for idx, (column_key, title) in enumerate(DEFAULT_COLUMNS):
+            conn.execute(
+                """
+                INSERT INTO columns (board_id, key, title, position, meta_json)
+                VALUES (?, ?, ?, ?, '{}')
+                """,
+                (board_id, column_key, title, idx),
+            )
+
+    existing_cards = conn.execute(
+        "SELECT COUNT(*) AS count FROM cards WHERE board_id = ?",
+        (board_id,),
+    ).fetchone()
+    if int(existing_cards["count"]) == 0:
+        column_rows = conn.execute(
+            "SELECT id, key FROM columns WHERE board_id = ?",
+            (board_id,),
+        ).fetchall()
+        column_id_by_key = {row["key"]: int(row["id"]) for row in column_rows}
+        card_position_by_column: dict[int, int] = {}
+        for column_key, title, details in DEFAULT_CARDS:
+            column_id = column_id_by_key[column_key]
+            position = card_position_by_column.get(column_id, 0)
+            card_position_by_column[column_id] = position + 1
+            conn.execute(
+                """
+                INSERT INTO cards (board_id, column_id, title, details, position, meta_json)
+                VALUES (?, ?, ?, ?, ?, '{}')
+                """,
+                (board_id, column_id, title, details, position),
+            )
+    return board_id
+
+
 def init_database(db_path: Path, mvp_username: str, mvp_password: str) -> None:
     with get_connection(db_path) as conn:
         conn.executescript(
@@ -73,6 +194,7 @@ def init_database(db_path: Path, mvp_username: str, mvp_password: str) -> None:
             CREATE TABLE IF NOT EXISTS users (
               id INTEGER PRIMARY KEY,
               username TEXT NOT NULL UNIQUE,
+              email TEXT UNIQUE,
               password_hash TEXT NOT NULL,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -122,83 +244,163 @@ def init_database(db_path: Path, mvp_username: str, mvp_password: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_columns_board_id ON columns(board_id);
             CREATE INDEX IF NOT EXISTS idx_cards_board_id ON cards(board_id);
             CREATE INDEX IF NOT EXISTS idx_cards_column_id ON cards(column_id);
+
+            CREATE TABLE IF NOT EXISTS sessions (
+              id INTEGER PRIMARY KEY,
+              user_id INTEGER NOT NULL,
+              token_hash TEXT NOT NULL UNIQUE,
+              expires_at INTEGER NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
             """
         )
 
+        user_columns = [
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        ]
+        if "email" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        conn.execute(
+            "UPDATE users SET email = username || ? WHERE email IS NULL OR TRIM(email) = ''",
+            (f"@{LOCAL_EMAIL_DOMAIN}",),
+        )
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+
+        seeded_email = _default_email_for_username(mvp_username)
         user = conn.execute(
             "SELECT id FROM users WHERE username = ?",
             (mvp_username,),
         ).fetchone()
         if user is None:
             conn.execute(
-                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                (mvp_username, hash_password(mvp_password)),
+                "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+                (mvp_username, seeded_email, hash_password(mvp_password)),
             )
             user = conn.execute(
                 "SELECT id FROM users WHERE username = ?",
                 (mvp_username,),
             ).fetchone()
-        user_id = int(user["id"])
-
-        board = conn.execute(
-            "SELECT id FROM boards WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if board is None:
+        else:
             conn.execute(
-                "INSERT INTO boards (user_id, name, settings_json) VALUES (?, ?, '{}')",
-                (user_id, "My Project Board"),
+                "UPDATE users SET email = COALESCE(email, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (seeded_email, int(user["id"])),
             )
-            board = conn.execute(
-                "SELECT id FROM boards WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-        board_id = int(board["id"])
-
-        existing_columns = conn.execute(
-            "SELECT COUNT(*) AS count FROM columns WHERE board_id = ?",
-            (board_id,),
-        ).fetchone()
-        if int(existing_columns["count"]) == 0:
-            for idx, (column_key, title) in enumerate(DEFAULT_COLUMNS):
-                conn.execute(
-                    """
-                    INSERT INTO columns (board_id, key, title, position, meta_json)
-                    VALUES (?, ?, ?, ?, '{}')
-                    """,
-                    (board_id, column_key, title, idx),
-                )
-
-        existing_cards = conn.execute(
-            "SELECT COUNT(*) AS count FROM cards WHERE board_id = ?",
-            (board_id,),
-        ).fetchone()
-        if int(existing_cards["count"]) == 0:
-            column_rows = conn.execute(
-                "SELECT id, key FROM columns WHERE board_id = ?",
-                (board_id,),
-            ).fetchall()
-            column_id_by_key = {row["key"]: int(row["id"]) for row in column_rows}
-            card_position_by_column: dict[int, int] = {}
-            for column_key, title, details in DEFAULT_CARDS:
-                column_id = column_id_by_key[column_key]
-                position = card_position_by_column.get(column_id, 0)
-                card_position_by_column[column_id] = position + 1
-                conn.execute(
-                    """
-                    INSERT INTO cards (board_id, column_id, title, details, position, meta_json)
-                    VALUES (?, ?, ?, ?, ?, '{}')
-                    """,
-                    (board_id, column_id, title, details, position),
-                )
+        user_id = int(user["id"])
+        _ensure_board_for_user_conn(conn, user_id)
 
 
 def get_user_by_username(db_path: Path, username: str) -> sqlite3.Row | None:
     with get_connection(db_path) as conn:
         return conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            "SELECT id, username, email, password_hash FROM users WHERE username = ?",
             (username,),
         ).fetchone()
+
+
+def get_user_by_email(db_path: Path, email: str) -> sqlite3.Row | None:
+    normalized = normalize_email(email)
+    with get_connection(db_path) as conn:
+        return conn.execute(
+            "SELECT id, username, email, password_hash FROM users WHERE email = ?",
+            (normalized,),
+        ).fetchone()
+
+
+def update_user_password(db_path: Path, user_id: int, password: str) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (hash_password(password), user_id),
+        )
+
+
+def create_user(db_path: Path, email: str, password: str) -> sqlite3.Row | None:
+    normalized = normalize_email(email)
+    with get_connection(db_path) as conn:
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (username, email, password_hash)
+                VALUES (?, ?, ?)
+                """,
+                (normalized, normalized, hash_password(password)),
+            )
+        except sqlite3.IntegrityError:
+            return None
+        user_id = int(cursor.lastrowid)
+        _ensure_board_for_user_conn(conn, user_id)
+        return conn.execute(
+            "SELECT id, username, email, password_hash FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def create_session(
+    db_path: Path,
+    user_id: int,
+    token_hash: str,
+    expires_at: int,
+) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO sessions (user_id, token_hash, expires_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, token_hash, expires_at),
+        )
+
+
+def get_session_user_by_token(
+    db_path: Path,
+    token_hash: str,
+    now_ts: int,
+) -> sqlite3.Row | None:
+    with get_connection(db_path) as conn:
+        return conn.execute(
+            """
+            SELECT s.token_hash, s.expires_at, u.id AS user_id, u.username, u.email
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ? AND s.expires_at > ?
+            """,
+            (token_hash, now_ts),
+        ).fetchone()
+
+
+def touch_session_expiry(
+    db_path: Path,
+    token_hash: str,
+    expires_at: int,
+) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET expires_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE token_hash = ?
+            """,
+            (expires_at, token_hash),
+        )
+
+
+def delete_session_by_token(db_path: Path, token_hash: str) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+
+
+def delete_expired_sessions(db_path: Path, now_ts: int) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_ts,))
 
 
 def get_board_for_user(db_path: Path, user_id: int) -> sqlite3.Row | None:
