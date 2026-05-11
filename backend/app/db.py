@@ -72,10 +72,6 @@ def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def _legacy_sha256_hash(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     key = hashlib.scrypt(
@@ -92,32 +88,27 @@ def hash_password(password: str) -> str:
     )
 
 
-def verify_password(stored_hash: str, password: str) -> tuple[bool, bool]:
+def verify_password(stored_hash: str, password: str) -> bool:
     parts = stored_hash.split("$")
-    if len(parts) == 6 and parts[0] == PASSWORD_SCHEME_SCRYPT:
-        try:
-            n = int(parts[1])
-            r = int(parts[2])
-            p = int(parts[3])
-            salt = bytes.fromhex(parts[4])
-            expected = bytes.fromhex(parts[5])
-        except (ValueError, TypeError):
-            return False, False
-
-        candidate = hashlib.scrypt(
-            password.encode("utf-8"),
-            salt=salt,
-            n=n,
-            r=r,
-            p=p,
-            dklen=len(expected),
-        )
-        return hmac.compare_digest(candidate, expected), False
-
-    legacy = _legacy_sha256_hash(password)
-    if hmac.compare_digest(stored_hash, legacy):
-        return True, True
-    return False, False
+    if len(parts) != 6 or parts[0] != PASSWORD_SCHEME_SCRYPT:
+        return False
+    try:
+        n = int(parts[1])
+        r = int(parts[2])
+        p = int(parts[3])
+        salt = bytes.fromhex(parts[4])
+        expected = bytes.fromhex(parts[5])
+    except (ValueError, TypeError):
+        return False
+    candidate = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=n,
+        r=r,
+        p=p,
+        dklen=len(expected),
+    )
+    return hmac.compare_digest(candidate, expected)
 
 
 def get_connection(db_path: Path) -> sqlite3.Connection:
@@ -377,6 +368,36 @@ def get_session_user_by_token(
         ).fetchone()
 
 
+def get_session_and_touch(
+    db_path: Path,
+    token_hash: str,
+    now_ts: int,
+    new_expires_at: int,
+) -> sqlite3.Row | None:
+    """Look up an active session and refresh its expiry in one connection."""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT s.token_hash, s.expires_at, u.id AS user_id, u.username, u.email
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ? AND s.expires_at > ?
+            """,
+            (token_hash, now_ts),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            """
+            UPDATE sessions
+            SET expires_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE token_hash = ?
+            """,
+            (new_expires_at, token_hash),
+        )
+        return row
+
+
 def touch_session_expiry(
     db_path: Path,
     token_hash: str,
@@ -475,6 +496,30 @@ def get_board_payload(db_path: Path, user_id: int) -> dict:
         }
 
 
+def _rename_column_conn(
+    conn: sqlite3.Connection,
+    user_id: int,
+    column_id: int,
+    title: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT c.id
+        FROM columns c
+        JOIN boards b ON b.id = c.board_id
+        WHERE c.id = ? AND b.user_id = ?
+        """,
+        (column_id, user_id),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute(
+        "UPDATE columns SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (title, column_id),
+    )
+    return True
+
+
 def rename_column(
     db_path: Path,
     user_id: int,
@@ -482,22 +527,48 @@ def rename_column(
     title: str,
 ) -> bool:
     with get_connection(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT c.id
-            FROM columns c
-            JOIN boards b ON b.id = c.board_id
-            WHERE c.id = ? AND b.user_id = ?
-            """,
-            (column_id, user_id),
-        ).fetchone()
-        if row is None:
-            return False
-        conn.execute(
-            "UPDATE columns SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (title, column_id),
-        )
-        return True
+        return _rename_column_conn(conn, user_id, column_id, title)
+
+
+def _create_card_conn(
+    conn: sqlite3.Connection,
+    user_id: int,
+    column_id: int,
+    title: str,
+    details: str,
+) -> dict | None:
+    target = conn.execute(
+        """
+        SELECT c.id, c.board_id
+        FROM columns c
+        JOIN boards b ON b.id = c.board_id
+        WHERE c.id = ? AND b.user_id = ?
+        """,
+        (column_id, user_id),
+    ).fetchone()
+    if target is None:
+        return None
+    board_id = int(target["board_id"])
+    last_position = conn.execute(
+        "SELECT COALESCE(MAX(position), -1) AS max_position FROM cards WHERE column_id = ?",
+        (column_id,),
+    ).fetchone()
+    next_position = int(last_position["max_position"]) + 1
+    cursor = conn.execute(
+        """
+        INSERT INTO cards (board_id, column_id, title, details, position, meta_json)
+        VALUES (?, ?, ?, ?, ?, '{}')
+        """,
+        (board_id, column_id, title, details, next_position),
+    )
+    card_id = int(cursor.lastrowid)
+    return {
+        "id": card_id,
+        "title": title,
+        "details": details,
+        "columnId": column_id,
+        "position": next_position,
+    }
 
 
 def create_card(
@@ -508,60 +579,71 @@ def create_card(
     details: str,
 ) -> dict | None:
     with get_connection(db_path) as conn:
-        target = conn.execute(
-            """
-            SELECT c.id, c.board_id
-            FROM columns c
-            JOIN boards b ON b.id = c.board_id
-            WHERE c.id = ? AND b.user_id = ?
-            """,
-            (column_id, user_id),
-        ).fetchone()
-        if target is None:
-            return None
-        board_id = int(target["board_id"])
-        last_position = conn.execute(
-            "SELECT COALESCE(MAX(position), -1) AS max_position FROM cards WHERE column_id = ?",
-            (column_id,),
-        ).fetchone()
-        next_position = int(last_position["max_position"]) + 1
-        cursor = conn.execute(
-            """
-            INSERT INTO cards (board_id, column_id, title, details, position, meta_json)
-            VALUES (?, ?, ?, ?, ?, '{}')
-            """,
-            (board_id, column_id, title, details, next_position),
-        )
-        card_id = int(cursor.lastrowid)
-        return {
-            "id": card_id,
-            "title": title,
-            "details": details,
-            "columnId": column_id,
-            "position": next_position,
-        }
+        return _create_card_conn(conn, user_id, column_id, title, details)
+
+
+def _delete_card_conn(
+    conn: sqlite3.Connection,
+    user_id: int,
+    card_id: int,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT c.id, c.column_id, c.position
+        FROM cards c
+        JOIN boards b ON b.id = c.board_id
+        WHERE c.id = ? AND b.user_id = ?
+        """,
+        (card_id, user_id),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute("DELETE FROM cards WHERE id = ?", (card_id,))
+    conn.execute(
+        "UPDATE cards SET position = position - 1 WHERE column_id = ? AND position > ?",
+        (int(row["column_id"]), int(row["position"])),
+    )
+    return True
 
 
 def delete_card(db_path: Path, user_id: int, card_id: int) -> bool:
     with get_connection(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT c.id, c.column_id, c.position
-            FROM cards c
-            JOIN boards b ON b.id = c.board_id
-            WHERE c.id = ? AND b.user_id = ?
-            """,
-            (card_id, user_id),
-        ).fetchone()
-        if row is None:
-            return False
+        return _delete_card_conn(conn, user_id, card_id)
 
-        conn.execute("DELETE FROM cards WHERE id = ?", (card_id,))
-        conn.execute(
-            "UPDATE cards SET position = position - 1 WHERE column_id = ? AND position > ?",
-            (int(row["column_id"]), int(row["position"])),
-        )
-        return True
+
+def _update_card_conn(
+    conn: sqlite3.Connection,
+    user_id: int,
+    card_id: int,
+    title: str,
+    details: str,
+) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT c.id, c.column_id, c.position
+        FROM cards c
+        JOIN boards b ON b.id = c.board_id
+        WHERE c.id = ? AND b.user_id = ?
+        """,
+        (card_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute(
+        """
+        UPDATE cards
+        SET title = ?, details = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (title, details, card_id),
+    )
+    return {
+        "id": card_id,
+        "title": title,
+        "details": details,
+        "columnId": int(row["column_id"]),
+        "position": int(row["position"]),
+    }
 
 
 def update_card(
@@ -572,32 +654,103 @@ def update_card(
     details: str,
 ) -> dict | None:
     with get_connection(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT c.id, c.column_id, c.position
-            FROM cards c
-            JOIN boards b ON b.id = c.board_id
-            WHERE c.id = ? AND b.user_id = ?
-            """,
-            (card_id, user_id),
-        ).fetchone()
-        if row is None:
-            return None
+        return _update_card_conn(conn, user_id, card_id, title, details)
+
+
+def _move_card_conn(
+    conn: sqlite3.Connection,
+    user_id: int,
+    card_id: int,
+    target_column_id: int,
+    target_position: int | None,
+) -> bool:
+    card = conn.execute(
+        """
+        SELECT c.id, c.board_id, c.column_id
+        FROM cards c
+        JOIN boards b ON b.id = c.board_id
+        WHERE c.id = ? AND b.user_id = ?
+        """,
+        (card_id, user_id),
+    ).fetchone()
+    if card is None:
+        return False
+    board_id = int(card["board_id"])
+    source_column_id = int(card["column_id"])
+
+    target = conn.execute(
+        """
+        SELECT c.id
+        FROM columns c
+        WHERE c.id = ? AND c.board_id = ?
+        """,
+        (target_column_id, board_id),
+    ).fetchone()
+    if target is None:
+        return False
+
+    source_ids = [
+        int(row["id"])
+        for row in conn.execute(
+            "SELECT id FROM cards WHERE column_id = ? ORDER BY position ASC, id ASC",
+            (source_column_id,),
+        ).fetchall()
+    ]
+    target_ids = source_ids if source_column_id == target_column_id else [
+        int(row["id"])
+        for row in conn.execute(
+            "SELECT id FROM cards WHERE column_id = ? ORDER BY position ASC, id ASC",
+            (target_column_id,),
+        ).fetchall()
+    ]
+
+    if card_id not in source_ids:
+        return False
+
+    source_ids.remove(card_id)
+    if source_column_id == target_column_id:
+        target_ids = source_ids
+
+    if target_position is None:
+        insert_at = len(target_ids)
+    else:
+        insert_at = max(0, min(target_position, len(target_ids)))
+    target_ids.insert(insert_at, card_id)
+
+    # Shift affected rows into a high range to dodge UNIQUE(column_id, position)
+    # during the per-row reassign below. The offset must exceed the number of
+    # cards being renumbered; 1M is safely beyond any practical Kanban column.
+    REORDER_OFFSET = 1_000_000
+    if source_column_id == target_column_id:
+        conn.execute(
+            "UPDATE cards SET position = position + ? WHERE column_id = ?",
+            (REORDER_OFFSET, source_column_id),
+        )
+    else:
         conn.execute(
             """
             UPDATE cards
-            SET title = ?, details = ?, updated_at = CURRENT_TIMESTAMP
+            SET column_id = ?, position = -1, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (title, details, card_id),
+            (target_column_id, card_id),
         )
-        return {
-            "id": card_id,
-            "title": title,
-            "details": details,
-            "columnId": int(row["column_id"]),
-            "position": int(row["position"]),
-        }
+        conn.execute(
+            "UPDATE cards SET position = position + ? WHERE column_id IN (?, ?)",
+            (REORDER_OFFSET, source_column_id, target_column_id),
+        )
+
+    for position, id_value in enumerate(source_ids):
+        conn.execute(
+            "UPDATE cards SET position = ? WHERE id = ?",
+            (position, id_value),
+        )
+    for position, id_value in enumerate(target_ids):
+        conn.execute(
+            "UPDATE cards SET position = ? WHERE id = ?",
+            (position, id_value),
+        )
+    return True
 
 
 def move_card(
@@ -608,88 +761,49 @@ def move_card(
     target_position: int | None,
 ) -> bool:
     with get_connection(db_path) as conn:
-        card = conn.execute(
-            """
-            SELECT c.id, c.board_id, c.column_id
-            FROM cards c
-            JOIN boards b ON b.id = c.board_id
-            WHERE c.id = ? AND b.user_id = ?
-            """,
-            (card_id, user_id),
-        ).fetchone()
-        if card is None:
-            return False
-        board_id = int(card["board_id"])
-        source_column_id = int(card["column_id"])
+        return _move_card_conn(
+            conn, user_id, card_id, target_column_id, target_position
+        )
 
-        target = conn.execute(
-            """
-            SELECT c.id
-            FROM columns c
-            WHERE c.id = ? AND c.board_id = ?
-            """,
-            (target_column_id, board_id),
-        ).fetchone()
-        if target is None:
-            return False
 
-        source_ids = [
-            int(row["id"])
-            for row in conn.execute(
-                "SELECT id FROM cards WHERE column_id = ? ORDER BY position ASC, id ASC",
-                (source_column_id,),
-            ).fetchall()
-        ]
-        target_ids = source_ids if source_column_id == target_column_id else [
-            int(row["id"])
-            for row in conn.execute(
-                "SELECT id FROM cards WHERE column_id = ? ORDER BY position ASC, id ASC",
-                (target_column_id,),
-            ).fetchall()
-        ]
+def apply_ai_board_update(
+    db_path: Path,
+    user_id: int,
+    rename_columns: list[tuple[int, str]],
+    create_cards: list[tuple[int, str, str]],
+    update_cards: list[tuple[int, str, str]],
+    move_cards: list[tuple[int, int, int | None]],
+    delete_cards: list[int],
+) -> list[str]:
+    """Apply all AI board operations in a single transaction.
 
-        if card_id not in source_ids:
-            return False
-
-        source_ids.remove(card_id)
-        if source_column_id == target_column_id:
-            target_ids = source_ids
-
-        if target_position is None:
-            insert_at = len(target_ids)
-        else:
-            insert_at = max(0, min(target_position, len(target_ids)))
-        target_ids.insert(insert_at, card_id)
-
-        # Move affected rows to temporary positions first to avoid
-        # UNIQUE(column_id, position) collisions during reordering.
-        if source_column_id == target_column_id:
-            conn.execute(
-                "UPDATE cards SET position = position + 1000 WHERE column_id = ?",
-                (source_column_id,),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE cards
-                SET column_id = ?, position = -1, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (target_column_id, card_id),
-            )
-            conn.execute(
-                "UPDATE cards SET position = position + 1000 WHERE column_id IN (?, ?)",
-                (source_column_id, target_column_id),
-            )
-
-        for position, id_value in enumerate(source_ids):
-            conn.execute(
-                "UPDATE cards SET position = ? WHERE id = ?",
-                (position, id_value),
-            )
-        for position, id_value in enumerate(target_ids):
-            conn.execute(
-                "UPDATE cards SET position = ? WHERE id = ?",
-                (position, id_value),
-            )
-        return True
+    Either every operation succeeds and the batch commits, or any reference
+    to a missing column/card raises ValueError and the entire batch rolls back.
+    """
+    operations: list[str] = []
+    with get_connection(db_path) as conn:
+        for column_id, title in rename_columns:
+            if not _rename_column_conn(conn, user_id, column_id, title):
+                raise ValueError(f"Column {column_id} not found")
+            operations.append(f"renamed column {column_id}")
+        for column_id, title, details in create_cards:
+            created = _create_card_conn(conn, user_id, column_id, title, details)
+            if created is None:
+                raise ValueError(f"Column {column_id} not found")
+            operations.append(f"created card {created['id']}")
+        for card_id, title, details in update_cards:
+            updated = _update_card_conn(conn, user_id, card_id, title, details)
+            if updated is None:
+                raise ValueError(f"Card {card_id} not found")
+            operations.append(f"updated card {card_id}")
+        for card_id, target_column_id, target_position in move_cards:
+            if not _move_card_conn(
+                conn, user_id, card_id, target_column_id, target_position
+            ):
+                raise ValueError(f"Card {card_id} or column {target_column_id} not found")
+            operations.append(f"moved card {card_id}")
+        for card_id in delete_cards:
+            if not _delete_card_conn(conn, user_id, card_id):
+                raise ValueError(f"Card {card_id} not found")
+            operations.append(f"deleted card {card_id}")
+    return operations

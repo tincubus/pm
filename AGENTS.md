@@ -15,7 +15,9 @@ For the MVP, there will only be a user sign in (hardcoded to 'user' and 'passwor
 
 For the MVP, there will only be 1 Kanban board per signed in user.
 
-For the MVP, this will run locally (in a docker container)
+For the MVP, this will run locally (in a docker container).
+
+The MVP also ships an open `/api/auth/register` endpoint (email + password, min 8 chars) so multiple local users can be created without a separate admin flow. It is intentionally simple: no rate limiting, no email verification, and the 409-on-duplicate response is observable (i.e. allows email enumeration). These are acceptable for a local-only container; they must be tightened before any deploy beyond localhost.
 
 ## Technical Decisions
 

@@ -1,5 +1,7 @@
 import os
+import re
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from secrets import token_urlsafe
 
@@ -8,8 +10,6 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from pydantic import BaseModel, Field
 
 from app import ai, ai_chat, db
-
-app = FastAPI(title="PM MVP Backend")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "pm.db"
@@ -20,6 +20,7 @@ SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 MIN_PASSWORD_LENGTH = 8
 COOKIE_SECURE = os.getenv("PM_COOKIE_SECURE", "false").strip().lower() == "true"
 CONVERSATION_HISTORY: dict[int, list[dict[str, str]]] = {}
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 LOGIN_PAGE_HTML = """<!doctype html>
 <html lang="en">
@@ -173,6 +174,17 @@ LOGIN_PAGE_HTML = """<!doctype html>
 """
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    CONVERSATION_HISTORY.clear()
+    db.init_database(DB_PATH, MVP_USERNAME, MVP_PASSWORD)
+    db.delete_expired_sessions(DB_PATH, int(time.time()))
+    yield
+
+
+app = FastAPI(title="PM MVP Backend", lifespan=lifespan)
+
+
 class LoginPayload(BaseModel):
     email: str
     password: str
@@ -225,14 +237,18 @@ def get_authenticated_user_id(request: Request) -> int:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
         )
-    token_hash = db.hash_session_token(session_token)
-    session = db.get_session_user_by_token(DB_PATH, token_hash, int(time.time()))
+    now_ts = int(time.time())
+    session = db.get_session_and_touch(
+        DB_PATH,
+        db.hash_session_token(session_token),
+        now_ts,
+        now_ts + SESSION_TTL_SECONDS,
+    )
     if session is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
         )
-    db.touch_session_expiry(DB_PATH, token_hash, int(time.time()) + SESSION_TTL_SECONDS)
     return int(session["user_id"])
 
 
@@ -264,14 +280,14 @@ def clear_session(request: Request, response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
 
 
-def static_path_for(full_path: str) -> Path:
+def static_path_for(full_path: str) -> Path | None:
     if not full_path or full_path == "/":
         return STATIC_DIR / "index.html"
     clean_path = full_path.lstrip("/")
     target_path = (STATIC_DIR / clean_path).resolve()
     static_root = STATIC_DIR.resolve()
     if static_root not in target_path.parents and target_path != static_root:
-        return STATIC_DIR / "index.html"
+        return None
     if target_path.is_dir():
         return target_path / "index.html"
     return target_path
@@ -287,17 +303,11 @@ def hello() -> dict[str, str]:
     return {"message": "hello world"}
 
 
-@app.on_event("startup")
-def startup() -> None:
-    CONVERSATION_HISTORY.clear()
-    db.init_database(DB_PATH, MVP_USERNAME, MVP_PASSWORD)
-
-
 @app.post("/api/auth/register")
 async def register(payload: RegisterPayload) -> Response:
     email = db.normalize_email(payload.email)
     password = payload.password
-    if "@" not in email:
+    if not EMAIL_RE.match(email):
         raise HTTPException(status_code=400, detail="A valid email address is required")
     if len(password) < MIN_PASSWORD_LENGTH:
         raise HTTPException(
@@ -317,15 +327,11 @@ async def login(payload: LoginPayload) -> Response:
         return JSONResponse(
             {"ok": False, "error": "Invalid credentials"}, status_code=401
         )
-    is_valid, needs_rehash = db.verify_password(user["password_hash"], payload.password)
-    if not is_valid:
+    if not db.verify_password(user["password_hash"], payload.password):
         return JSONResponse(
             {"ok": False, "error": "Invalid credentials"}, status_code=401
         )
-    user_id = int(user["id"])
-    if needs_rehash:
-        db.update_user_password(DB_PATH, user_id, payload.password)
-    return create_authenticated_response(user_id)
+    return create_authenticated_response(int(user["id"]))
 
 
 @app.post("/api/auth/logout")
@@ -347,11 +353,15 @@ def session(request: Request) -> dict:
     session_token = request.cookies.get(SESSION_COOKIE_NAME)
     if not session_token:
         return {"authenticated": False, "user": None}
-    token_hash = db.hash_session_token(session_token)
-    row = db.get_session_user_by_token(DB_PATH, token_hash, int(time.time()))
+    now_ts = int(time.time())
+    row = db.get_session_and_touch(
+        DB_PATH,
+        db.hash_session_token(session_token),
+        now_ts,
+        now_ts + SESSION_TTL_SECONDS,
+    )
     if row is None:
         return {"authenticated": False, "user": None}
-    db.touch_session_expiry(DB_PATH, token_hash, int(time.time()) + SESSION_TTL_SECONDS)
     return {
         "authenticated": True,
         "user": {
@@ -477,45 +487,34 @@ def ai_chat_route(payload: AIChatPayload, request: Request) -> dict:
 
     board_update = structured.board_update
     if not parse_error and board_update is not None:
-        for action in board_update.rename_columns:
-            if db.rename_column(DB_PATH, user_id, action.column_id, action.title.strip()):
-                applied_operations.append(f"renamed column {action.column_id}")
-        for action in board_update.create_cards:
-            created = db.create_card(
+        try:
+            applied_operations = db.apply_ai_board_update(
                 DB_PATH,
                 user_id,
-                action.column_id,
-                action.title.strip(),
-                action.details.strip(),
+                rename_columns=[
+                    (a.column_id, a.title.strip()) for a in board_update.rename_columns
+                ],
+                create_cards=[
+                    (a.column_id, a.title.strip(), a.details.strip())
+                    for a in board_update.create_cards
+                ],
+                update_cards=[
+                    (a.card_id, a.title.strip(), a.details.strip())
+                    for a in board_update.update_cards
+                ],
+                move_cards=[
+                    (a.card_id, a.target_column_id, a.target_position)
+                    for a in board_update.move_cards
+                ],
+                delete_cards=list(board_update.delete_cards),
             )
-            if created is not None:
-                applied_operations.append(f"created card {created['id']}")
-        for action in board_update.update_cards:
-            updated = db.update_card(
-                DB_PATH,
-                user_id,
-                action.card_id,
-                action.title.strip(),
-                action.details.strip(),
+            updated_board = db.get_board_payload(DB_PATH, user_id)
+        except ValueError as exc:
+            applied_operations = []
+            assistant_response = (
+                f"I could not apply those board changes ({exc}). "
+                "No partial updates were saved."
             )
-            if updated is not None:
-                applied_operations.append(f"updated card {action.card_id}")
-        for action in board_update.move_cards:
-            moved = db.move_card(
-                DB_PATH,
-                user_id,
-                action.card_id,
-                action.target_column_id,
-                action.target_position,
-            )
-            if moved:
-                applied_operations.append(f"moved card {action.card_id}")
-        for card_id in board_update.delete_cards:
-            deleted = db.delete_card(DB_PATH, user_id, card_id)
-            if deleted:
-                applied_operations.append(f"deleted card {card_id}")
-
-        updated_board = db.get_board_payload(DB_PATH, user_id)
 
     history.append({"role": "user", "content": payload.message})
     history.append({"role": "assistant", "content": assistant_response})
@@ -537,8 +536,12 @@ def app_routes(full_path: str, request: Request) -> Response:
         return HTMLResponse(LOGIN_PAGE_HTML)
 
     target_path = static_path_for(full_path)
+    if target_path is None:
+        raise HTTPException(status_code=404, detail="Not found")
     if target_path.exists():
         return FileResponse(target_path)
-    return HTMLResponse(
-        "<h1>Frontend static build is not available yet.</h1>", status_code=503
-    )
+    if not STATIC_DIR.exists():
+        return HTMLResponse(
+            "<h1>Frontend static build is not available yet.</h1>", status_code=503
+        )
+    raise HTTPException(status_code=404, detail="Not found")

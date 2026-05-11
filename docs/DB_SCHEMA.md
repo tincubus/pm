@@ -1,6 +1,6 @@
-# Database Schema Proposal (Part 5)
+# Database Schema
 
-This document proposes the MVP SQLite data model for the Kanban app.
+This document describes the MVP SQLite data model for the Kanban app. It is kept in sync with the live schema in [backend/app/db.py](../backend/app/db.py).
 
 ## Goals
 
@@ -13,20 +13,25 @@ This document proposes the MVP SQLite data model for the Kanban app.
 
 ### `users`
 
-- One row per user.
-- MVP includes one seeded user (`username = "user"`).
+- One row per user. Login is by email; `username` is retained for legacy compatibility with the seeded user and is set equal to the email for newly-registered users.
+- MVP seeds one user (`username = "user"`, `email = "user@local.pm"`).
 
 Columns:
 
 - `id` INTEGER PRIMARY KEY
 - `username` TEXT NOT NULL UNIQUE
-- `password_hash` TEXT NOT NULL
+- `email` TEXT (backfilled from `username || '@local.pm'` on first migration; unique index added separately)
+- `password_hash` TEXT NOT NULL — scrypt format `scrypt$N$r$p$salt_hex$key_hex`
 - `created_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 - `updated_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 
+Indexes:
+
+- `idx_users_email` UNIQUE on `(email)` — created as a separate `CREATE UNIQUE INDEX IF NOT EXISTS` so the column can be added by `ALTER TABLE` on existing DBs.
+
 Notes:
 
-- We store hashed password (even for MVP dummy login) to keep a clean upgrade path.
+- Passwords are hashed with `scrypt` (N=2^14, r=8, p=1) and a per-user 16-byte salt. Verification is constant-time.
 
 ### `boards`
 
@@ -102,6 +107,29 @@ JSON usage:
 
 - `meta_json` stores optional card metadata (future labels, due dates, AI annotations, etc.).
 
+### `sessions`
+
+- One row per active login. Session cookie value is a 32-byte URL-safe token; only its SHA-256 hash is stored.
+- Cleaned up on startup and on each successful login/register.
+
+Columns:
+
+- `id` INTEGER PRIMARY KEY
+- `user_id` INTEGER NOT NULL
+- `token_hash` TEXT NOT NULL UNIQUE — hex SHA-256 of the cookie value
+- `expires_at` INTEGER NOT NULL — Unix timestamp; sliding TTL of 7 days, refreshed on every authenticated request
+- `created_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+- `updated_at` TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+
+Constraints:
+
+- `FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE`
+
+Indexes:
+
+- `idx_sessions_user_id` on `(user_id)`
+- `idx_sessions_expires_at` on `(expires_at)`
+
 ## DDL (Reference)
 
 ```sql
@@ -110,10 +138,12 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
+  email TEXT,
   password_hash TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
 CREATE TABLE IF NOT EXISTS boards (
   id INTEGER PRIMARY KEY,
@@ -159,6 +189,18 @@ CREATE INDEX IF NOT EXISTS idx_boards_user_id ON boards(user_id);
 CREATE INDEX IF NOT EXISTS idx_columns_board_id ON columns(board_id);
 CREATE INDEX IF NOT EXISTS idx_cards_board_id ON cards(board_id);
 CREATE INDEX IF NOT EXISTS idx_cards_column_id ON cards(column_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  expires_at INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 ```
 
 ## Seed Data Strategy

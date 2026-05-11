@@ -13,7 +13,7 @@ import {
 } from "@dnd-kit/core";
 import { KanbanColumn } from "@/components/KanbanColumn";
 import { KanbanCardPreview } from "@/components/KanbanCardPreview";
-import { createId, initialData, moveCard, type BoardData } from "@/lib/kanban";
+import { createId, initialData, moveCard as moveCardLocal, type BoardData } from "@/lib/kanban";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -162,6 +162,33 @@ export const KanbanBoard = () => {
     setActiveCardId(event.active.id as string);
   };
 
+  const mutateBoard = useCallback(
+    async (
+      method: string,
+      url: string,
+      body: object | null,
+      options: { refetchOnSuccess?: boolean } = {}
+    ) => {
+      try {
+        const response = await fetch(url, {
+          method,
+          headers: body !== null ? { "Content-Type": "application/json" } : undefined,
+          body: body !== null ? JSON.stringify(body) : undefined,
+        });
+        if (!response.ok) {
+          await loadBoardFromBackend();
+          return;
+        }
+        if (options.refetchOnSuccess) {
+          await loadBoardFromBackend();
+        }
+      } catch {
+        await loadBoardFromBackend().catch(() => {});
+      }
+    },
+    [loadBoardFromBackend]
+  );
+
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     setActiveCardId(null);
@@ -210,54 +237,42 @@ export const KanbanBoard = () => {
           ? targetColumn.cardIds.filter((id) => id !== activeUiCardId).length
           : overIndex;
 
-      void fetch(`/api/cards/${backendCardId}/move`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          target_column_id: targetBackendColumnId,
-          target_position:
-            sourceColumn.id === targetColumnUiId && sourceIndex === overIndex
-              ? sourceIndex
-              : targetPosition,
-        }),
-      }).then(async (response) => {
-        if (response.ok) {
-          await loadBoardFromBackend();
-        }
+      setBoard((prev) => ({
+        ...prev,
+        columns: moveCardLocal(prev.columns, activeUiCardId, overUiId),
+      }));
+
+      void mutateBoard("POST", `/api/cards/${backendCardId}/move`, {
+        target_column_id: targetBackendColumnId,
+        target_position:
+          sourceColumn.id === targetColumnUiId && sourceIndex === overIndex
+            ? sourceIndex
+            : targetPosition,
       });
       return;
     }
 
     setBoard((prev) => ({
       ...prev,
-      columns: moveCard(prev.columns, active.id as string, over.id as string),
+      columns: moveCardLocal(prev.columns, active.id as string, over.id as string),
     }));
   };
 
   const handleRenameColumn = (columnId: string, title: string) => {
-    if (usesBackend) {
-      const backendColumnId = columnIdByUiId[columnId];
-      if (!backendColumnId) {
-        return;
-      }
-      void fetch(`/api/columns/${backendColumnId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title }),
-      }).then(async (response) => {
-        if (response.ok) {
-          await loadBoardFromBackend();
-        }
-      });
-      return;
-    }
-
     setBoard((prev) => ({
       ...prev,
       columns: prev.columns.map((column) =>
         column.id === columnId ? { ...column, title } : column
       ),
     }));
+
+    if (usesBackend) {
+      const backendColumnId = columnIdByUiId[columnId];
+      if (!backendColumnId) {
+        return;
+      }
+      void mutateBoard("PATCH", `/api/columns/${backendColumnId}`, { title });
+    }
   };
 
   const handleAddCard = (columnId: string, title: string, details: string) => {
@@ -266,15 +281,12 @@ export const KanbanBoard = () => {
       if (!backendColumnId) {
         return;
       }
-      void fetch(`/api/columns/${backendColumnId}/cards`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, details }),
-      }).then(async (response) => {
-        if (response.ok) {
-          await loadBoardFromBackend();
-        }
-      });
+      void mutateBoard(
+        "POST",
+        `/api/columns/${backendColumnId}/cards`,
+        { title, details },
+        { refetchOnSuccess: true }
+      );
       return;
     }
 
@@ -294,37 +306,25 @@ export const KanbanBoard = () => {
   };
 
   const handleDeleteCard = (columnId: string, cardId: string) => {
+    setBoard((prev) => ({
+      ...prev,
+      cards: Object.fromEntries(
+        Object.entries(prev.cards).filter(([id]) => id !== cardId)
+      ),
+      columns: prev.columns.map((column) =>
+        column.id === columnId
+          ? { ...column, cardIds: column.cardIds.filter((id) => id !== cardId) }
+          : column
+      ),
+    }));
+
     if (usesBackend) {
       const backendCardId = cardIdByUiId[cardId];
       if (!backendCardId) {
         return;
       }
-      void fetch(`/api/cards/${backendCardId}`, {
-        method: "DELETE",
-      }).then(async (response) => {
-        if (response.ok) {
-          await loadBoardFromBackend();
-        }
-      });
-      return;
+      void mutateBoard("DELETE", `/api/cards/${backendCardId}`, null);
     }
-
-    setBoard((prev) => {
-      return {
-        ...prev,
-        cards: Object.fromEntries(
-          Object.entries(prev.cards).filter(([id]) => id !== cardId)
-        ),
-        columns: prev.columns.map((column) =>
-          column.id === columnId
-            ? {
-                ...column,
-                cardIds: column.cardIds.filter((id) => id !== cardId),
-              }
-            : column
-        ),
-      };
-    });
   };
 
   const handleLogout = () => {
@@ -474,7 +474,7 @@ export const KanbanBoard = () => {
             <div className="mt-4 h-[420px] overflow-y-auto rounded-2xl border border-[var(--stroke)] bg-[var(--surface)] p-3">
               {chatMessages.length === 0 ? (
                 <p className="text-sm text-[var(--gray-text)]">
-                  Try: "Add a card to Backlog for API docs."
+                  Try: &quot;Add a card to Backlog for API docs.&quot;
                 </p>
               ) : (
                 <div className="space-y-3">

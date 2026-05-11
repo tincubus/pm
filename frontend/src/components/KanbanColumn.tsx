@@ -1,3 +1,4 @@
+import { useState } from "react";
 import clsx from "clsx";
 import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
@@ -21,6 +22,21 @@ export const KanbanColumn = ({
   onDeleteCard,
 }: KanbanColumnProps) => {
   const { setNodeRef, isOver } = useDroppable({ id: column.id });
+  const [titleDraft, setTitleDraft] = useState(column.title);
+  const [syncedTitle, setSyncedTitle] = useState(column.title);
+  if (syncedTitle !== column.title) {
+    setSyncedTitle(column.title);
+    setTitleDraft(column.title);
+  }
+
+  const commitTitle = () => {
+    const trimmed = titleDraft.trim();
+    if (trimmed && trimmed !== column.title) {
+      onRename(column.id, trimmed);
+    } else {
+      setTitleDraft(column.title);
+    }
+  };
 
   return (
     <section
@@ -40,8 +56,18 @@ export const KanbanColumn = ({
             </span>
           </div>
           <input
-            value={column.title}
-            onChange={(event) => onRename(column.id, event.target.value)}
+            value={titleDraft}
+            onChange={(event) => setTitleDraft(event.target.value)}
+            onBlur={commitTitle}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                event.currentTarget.blur();
+              } else if (event.key === "Escape") {
+                setTitleDraft(column.title);
+                event.currentTarget.blur();
+              }
+            }}
             className="mt-3 w-full bg-transparent font-display text-lg font-semibold text-[var(--navy-dark)] outline-none"
             aria-label="Column title"
           />

@@ -9,9 +9,11 @@ This directory now contains the FastAPI backend for the PM MVP.
   - `GET /`: auth-gated frontend route. Shows login page when signed out, static Kanban app when signed in.
   - `GET /api/health`: basic health endpoint.
   - `GET /api/hello`: sample API endpoint.
-  - `POST /api/auth/login`: accepts MVP credentials and sets session cookie.
+  - `POST /api/auth/register`: creates a new user with email + password (min 8 chars) and sets session cookie.
+  - `POST /api/auth/login`: accepts email + password, sets session cookie. Generic error for invalid credentials.
   - `POST /api/auth/logout`: clears session cookie.
-  - `GET /api/auth/session`: reports current auth state.
+  - `GET /logout`: clears session and redirects to `/`.
+  - `GET /api/auth/session`: reports current auth state. Refreshes session expiry as a side effect.
 - `app/db.py`: SQLite schema/init/seed logic and board mutation helpers.
 - `GET /api/board`: returns the authenticated user's board.
 - `PATCH /api/columns/{column_id}`: renames a column.
@@ -30,6 +32,4 @@ This directory now contains the FastAPI backend for the PM MVP.
 
 ### Current scope
 
-This includes Part 2 scaffolding, Part 3 static frontend serving, Part 4 fake login/session gating, Part 6 backend board APIs, Part 8 AI connectivity smoke route, and Part 9 structured AI backend behavior. It does not yet include:
-
-- full frontend sidebar AI chat integration
+All MVP parts 2-10 are implemented. Backend covers scaffolding, static frontend serving, login/session gating, board CRUD APIs, OpenRouter connectivity, and structured AI chat with transactional board mutations via `db.apply_ai_board_update`.
